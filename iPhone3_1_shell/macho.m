@@ -56,6 +56,10 @@ extern host_name_port_t   mach_host_self(void);
 kern_return_t (* mach_vm_read)(vm_map_t target_task, mach_vm_address_t address,
 	       	mach_vm_size_t size, vm_offset_t *data,
 	       	mach_msg_type_number_t *dataCnt);
+kern_return_t (* mach_vm_read_overwrite)(vm_map_t target_task, mach_vm_address_t address,
+	       	mach_vm_size_t size, mach_vm_address_t data,
+	       	mach_vm_size_t *out_size);
+
 kern_return_t (* mach_vm_write)(vm_map_t target_task, mach_vm_address_t address,
 	       	vm_offset_t data, mach_msg_type_number_t dataCnt);
 kern_return_t (* mach_vm_deallocate)(vm_map_t target, mach_vm_address_t address, mach_vm_size_t size);
@@ -398,6 +402,38 @@ int super_port_to_tfp0(int pipe[2], unsigned off, addr_t task0, addr_t space0,
 	return 0;
 }
 
+void kread(uint64_t from, void *to, size_t size)
+{
+#define BLOCK_SIZE 0xf00
+    mach_vm_size_t outsize = size;
+
+    size_t szt = size;
+    if (size > BLOCK_SIZE) {
+        size = BLOCK_SIZE;
+    }
+
+    size_t off = 0;
+
+    while (1) {
+        kern_return_t kr = mach_vm_read_overwrite(tfp0, off+from,
+		       	size, (mach_vm_offset_t)(off+to), &outsize);
+	if (kr != KERN_SUCCESS) {
+		NSLog(@"mach_vm_read_overwrite failed, left: %zu, kr: %d", szt, kr);
+		return;
+	}
+        szt -= size;
+        off += size;
+        if (szt == 0) {
+            break;
+        }
+        size = szt;
+        if (size > BLOCK_SIZE) {
+            size = BLOCK_SIZE;
+        }
+    }
+#undef BLOCK_SIZE
+}
+
 uint32_t kr32(addr_t from)
 {
 	kern_return_t kr;
@@ -589,6 +625,7 @@ int main(int argc, char** argv)
 	resolve(io_service_add_notification_ool);
 	resolve(IOMasterPort);
 	resolve(mach_vm_read);
+	resolve(mach_vm_read_overwrite);
 	resolve(mach_vm_write);
 	resolve(mach_vm_deallocate);
 
